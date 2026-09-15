@@ -25,7 +25,7 @@ members = [
 default = ["compiler", "value", "diagnostic", "path", "parser", "stdlib", "datadog", "core", "observo"]
 
 # Main features (on by default)
-compiler = ["diagnostic", "path", "parser", "value", "dep:paste", "dep:chrono", "dep:serde", "dep:regex", "dep:bytes", "dep:ordered-float", "dep:chrono-tz", "dep:snafu", "dep:thiserror", "dep:dyn-clone", "dep:indoc", "dep:thiserror", "dep:lalrpop-util"]
+compiler = ["diagnostic", "path", "parser", "value", "dep:paste", "dep:chrono", "dep:serde", "dep:regex", "dep:bytes", "dep:ordered-float", "dep:chrono-tz", "dep:snafu", "dep:thiserror", "dep:dyn-clone", "dep:indoc", "dep:thiserror", "dep:lalrpop-util", "dep:stacker", "dep:psm"]
 value = ["path", "dep:bytes", "dep:regex", "dep:ordered-float", "dep:chrono", "dep:serde_json"]
 diagnostic = ["dep:codespan-reporting", "dep:termcolor"]
 path = ["value", "dep:once_cell", "dep:serde", "dep:snafu", "dep:regex"]
@@ -163,6 +163,14 @@ ordered-float = { version = "4", default-features = false, optional = true }
 md-5 = { version = "0.10", optional = true }
 metrics = { version = "0.24.0", optional = true }
 metrics-util = { version = "0.19.0", optional = true }
+# Pinned below 0.1.22: 0.1.22+ pulls in a `psm` that requires edition2024 (see below) and does
+# not build on the toolchain this crate pins (see rust-toolchain.toml, Rust 1.83).
+stacker = { version = ">=0.1, <0.1.22", optional = true }
+# `stacker`'s own version bound doesn't hold psm down (stacker 0.1.21 accepts any 0.1.x psm), so
+# without this, a plain `cargo update` floats psm to 0.1.29+, which pulls in ar_archive_writer
+# 0.5.3 requiring edition2024 / Rust 1.88 and breaks the Rust 1.83 build. Verified against
+# rustc 1.83: 0.1.28 builds, 0.1.29 fails with "feature `edition2024` is required".
+psm = { version = ">=0.1, <0.1.29", optional = true }
 paste = { version = "1", default-features = false, optional = true }
 parse-size = { version = "1.1.0",  optional = true }
 peeking_take_while = { version = "1", default-features = false, optional = true }

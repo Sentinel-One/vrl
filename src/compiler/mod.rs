@@ -56,6 +56,8 @@ pub use self::deprecation_warning::DeprecationWarning;
 #[allow(clippy::module_inception)]
 mod compiler;
 
+mod ast_teardown;
+
 mod compile_config;
 mod context;
 mod datetime;
@@ -109,17 +111,25 @@ pub fn compile_with_state(
     let ast = parse(source)
         .map_err(|err| crate::diagnostic::DiagnosticList::from(vec![Box::new(err) as Box<_>]))?;
 
-    let unused_expression_check_enabled = config.unused_expression_check_enabled();
-    let result = Compiler::compile(fns, ast.clone(), state, config);
+    // OBE-10738: this used to be `Compiler::compile(fns, ast.clone(), ..)` so that `ast` survived
+    // for the unused-expression check below. `Clone` on the AST is derived, so it recursed once
+    // per expression-nesting level and overflowed the native stack on a deeply-nested program —
+    // before the compiler ran, and so before any guard inside it could fire. Running the check
+    // first lets the AST be moved into the compiler instead of copied, which removes that
+    // recursion entirely and saves cloning the whole tree on every single compile.
+    let unused_warnings = if config.unused_expression_check_enabled() {
+        check_for_unused_results(&ast)
+    } else {
+        DiagnosticList::default()
+    };
 
-    if unused_expression_check_enabled {
-        let unused_warnings = check_for_unused_results(&ast);
-        if !unused_warnings.is_empty() {
-            return result.map(|mut compilation_result| {
-                compilation_result.warnings.extend(unused_warnings);
-                compilation_result
-            });
-        }
+    let result = Compiler::compile(fns, ast, state, config);
+
+    if !unused_warnings.is_empty() {
+        return result.map(|mut compilation_result| {
+            compilation_result.warnings.extend(unused_warnings);
+            compilation_result
+        });
     }
 
     result

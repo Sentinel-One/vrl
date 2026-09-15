@@ -18,6 +18,7 @@
 /// ## Caveats
 /// - **Closures**: Closure support is minimal. For now, we are only ensuring that there are no false positives.
 /// - **Variable Shadowing**: Variable shadowing is not supported. Unused variables will not be detected in this case.
+use super::compiler::STACK_RESERVE_FRACTION;
 use crate::compiler::codes::WARNING_UNUSED_CODE;
 use crate::compiler::parser::{Ident, Node};
 use crate::diagnostic::{Diagnostic, DiagnosticList, Label, Note, Severity};
@@ -50,7 +51,7 @@ struct IdentState {
     used_in_closure: bool,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct VisitorState {
     level: usize,
     expecting_result: HashMap<usize, bool>,
@@ -58,6 +59,44 @@ struct VisitorState {
     ident_to_state: BTreeMap<Ident, IdentState>,
     visiting_closure: bool,
     diagnostics: DiagnosticList,
+
+    /// Stack level below which `visit_node` stops descending. `None` where the platform cannot
+    /// report remaining stack, in which case the walk behaves as it always has.
+    stack_floor: Option<usize>,
+}
+
+// Hand-written rather than derived so that `stack_floor` is always computed from the actual
+// stack, not left `None` — a `None` here silently disables the guard in `visit_node`.
+impl Default for VisitorState {
+    fn default() -> Self {
+        let stack_floor = stacker::remaining_stack().map(|r| r / STACK_RESERVE_FRACTION);
+
+        let mut diagnostics = DiagnosticList::default();
+        if stack_floor.is_none() {
+            // Can't fail the check outright here — this walk is advisory only, so all we can do
+            // is tell the operator we can't tell how much stack is available on this platform.
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                code: WARNING_UNUSED_CODE,
+                message: "cannot determine remaining stack on this platform".to_owned(),
+                labels: vec![],
+                notes: vec![Note::Basic(
+                    "the unused-expression check may be abandoned partway through deeply nested programs"
+                        .to_owned(),
+                )],
+            });
+        }
+
+        Self {
+            level: 0,
+            expecting_result: HashMap::new(),
+            within_block_expression: HashMap::new(),
+            ident_to_state: BTreeMap::new(),
+            visiting_closure: false,
+            diagnostics,
+            stack_floor,
+        }
+    }
 }
 
 impl VisitorState {
@@ -190,6 +229,27 @@ fn scoped_visit(state: &mut VisitorState, f: impl FnOnce(&mut VisitorState)) {
 
 impl AstVisitor<'_> {
     fn visit_node(&self, node: &Node<Expr>, state: &mut VisitorState) {
+        // OBE-10738: this walk recurses once per expression-nesting level, on the raw AST and
+        // before the compiler's own guard can apply. It only produces advisory warnings, so when
+        // the stack runs short the correct move is to stop descending rather than to fail — a
+        // deeply-nested program is about to be rejected by the compiler anyway, and losing
+        // unused-expression warnings for its deepest nodes costs nothing.
+        if let (Some(remaining), Some(floor)) = (stacker::remaining_stack(), state.stack_floor) {
+            if remaining < floor {
+                state.diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    code: WARNING_UNUSED_CODE,
+                    message: format!("unused check abandoned, stack bottomed out at {floor} bytes"),
+                    labels: vec![Label::primary(
+                        "the unused-expression check did not descend past this point",
+                        node.span(),
+                    )],
+                    notes: vec![],
+                });
+                return;
+            }
+        }
+
         let expression = node.inner();
 
         match expression {
