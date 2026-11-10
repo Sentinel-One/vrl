@@ -3,7 +3,7 @@ use nom::{
     branch::alt,
     bytes::complete::{escaped, tag, take_while, take_while1},
     character::complete::{char, digit1, satisfy},
-    combinator::{cut, map, opt, recognize, value},
+    combinator::{cut, map, map_opt, opt, recognize, value},
     error::{context, ContextError, FromExternalError, ParseError},
     multi::{many1, separated_list0},
     number::complete::double,
@@ -214,7 +214,8 @@ fn parse_value<'a, E: HashParseError<&'a str>>(
                 parse_array(depth),
                 map(parse_colon_key, Value::from),
                 map(parse_bytes, Value::Bytes),
-                map(double, |value| Value::Float(NotNan::new(value).unwrap())),
+                // NaN fails here instead of panicking.
+                map_opt(double, |value| NotNan::new(value).ok().map(Value::Float)),
                 map(parse_boolean, Value::Boolean),
             )),
         )(input)
@@ -372,5 +373,25 @@ mod tests {
         let input = format!("{open}1{close}");
         let result = parse_ruby_hash(&input);
         assert!(result.is_err(), "hash with 200 nesting levels must be rejected (OBE-10741)");
+    }
+
+    #[test]
+    fn test_nan_rejected_obe12846() {
+        // OBE-12846: NaN literals must be a parse error, not a panic.
+        for input in [
+            r#"{ "k" => NaN }"#,
+            r#"{ "k" => -nan }"#,
+            r#"{ :k => NAN }"#,
+            r#"{ "k" => [NaN] }"#,
+            r#"{ "k" => { "n" => NaN } }"#,
+            r#"{ "a" => 1, "b" => 2, "c" => NaN }"#,
+        ] {
+            assert!(parse_ruby_hash(input).is_err(), "{input} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_infinity_does_not_panic_obe12846() {
+        let _ = parse_ruby_hash(r#"{ "k" => Infinity }"#);
     }
 }
