@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, ops::IndexMut};
+use std::ops::IndexMut;
 
 use super::{KeyString, Value};
 
@@ -34,7 +34,7 @@ impl Value {
     /// - Any mutations done to the array before recursing into it are
     ///   preserved, meaning once recursion starts, the mutations done on the
     ///   object itself are preserved.
-    pub fn into_iter<'a>(self, recursive: bool) -> ValueIter<'a> {
+    pub fn into_iter(self, recursive: bool) -> ValueIter {
         let data = match self {
             Self::Object(object) => IterData::Object(object.into_iter().collect()),
             Self::Array(array) => IterData::Array(array),
@@ -45,17 +45,17 @@ impl Value {
     }
 }
 
-/// An [`Iterator`] over a [`Value`].
-pub struct ValueIter<'a> {
+/// A lending iterator over a [`Value`].
+pub struct ValueIter {
     data: IterData,
     recursive: bool,
     index: usize,
     recursive_iter: Option<Box<Self>>,
     must_prepare_recursion: bool,
-    phantom: PhantomData<&'a mut ()>,
+    in_recursive: bool,
 }
 
-/// The [`Iterator::Item`] returned by the [`ValueIter`] iterator.
+/// The item returned by [`ValueIter::next`].
 #[derive(Debug, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum IterItem<'a> {
@@ -79,7 +79,7 @@ enum IterData {
     Array(Vec<Value>),
 }
 
-impl ValueIter<'_> {
+impl ValueIter {
     /// Create a new iterator over the relevant [`IterData`].
     fn new(data: IterData, recursive: bool) -> Self {
         Self {
@@ -88,16 +88,24 @@ impl ValueIter<'_> {
             index: 0,
             recursive_iter: None,
             must_prepare_recursion: false,
-            phantom: PhantomData,
+            in_recursive: false,
         }
     }
 }
 
-impl<'a> Iterator for ValueIter<'a> {
-    type Item = IterItem<'a>;
+impl ValueIter {
+    /// Return the next item, borrowed from the iterator itself.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<IterItem<'_>> {
+        if self.advance() {
+            self.current()
+        } else {
+            None
+        }
+    }
 
-    #[allow(clippy::deref_addrof)]
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Move to the next item, returning false when exhausted.
+    fn advance(&mut self) -> bool {
         // If this returns true, it means on the last iteration cycle, we've
         // returned a collection value-type, and the caller asked to recurse
         // into that collection.
@@ -111,10 +119,11 @@ impl<'a> Iterator for ValueIter<'a> {
 
             // Get the relevant collection `Value` type we want to iterate over.
             let value = match &mut self.data {
-                IterData::Object(object) => &mut object.get_mut(self.index - 1)?.1,
-                IterData::Array(array) => array.get_mut(self.index - 1)?,
+                IterData::Object(object) => object.get_mut(self.index - 1).map(|kv| &mut kv.1),
+                IterData::Array(array) => array.get_mut(self.index - 1),
                 IterData::Value(_) => unreachable!("cannot recurse into non-container type"),
             };
+            let Some(value) = value else { return false };
 
             // Create a new `IterData` type we're going to embed recursively
             // into this iterator, to allow iterating over.
@@ -146,116 +155,78 @@ impl<'a> Iterator for ValueIter<'a> {
 
         // If we have a recursive iterator stored, it means we're asked to
         // continue iterating that iterator until it is exhausted.
+        self.in_recursive = false;
         if let Some(iter) = &mut self.recursive_iter {
-            match iter.next() {
-                // Keep returning recursive items until the iterator is
-                // exhausted.
-                item @ Some(..) => return item,
-
-                // Now that we're done recursing, we need to update the relevant `Value`
-                // collection type stored in this iterator, with the updated
-                // inner elements that the recursive iterator might have
-                // mutated.
-                None => {
-                    let value = match &mut self.data {
-                        IterData::Object(object) => &mut object.index_mut(self.index - 1).1,
-                        IterData::Array(array) => array.index_mut(self.index - 1),
-                        IterData::Value(_) => {
-                            unreachable!("cannot recurse into non-container type")
-                        }
-                    };
-
-                    *value = (*self.recursive_iter.take().unwrap()).into();
-                }
+            // Keep returning recursive items until the iterator is exhausted.
+            if iter.advance() {
+                self.in_recursive = true;
+                return true;
             }
-        };
+
+            // Now that we're done recursing, we need to update the relevant `Value`
+            // collection type stored in this iterator, with the updated
+            // inner elements that the recursive iterator might have
+            // mutated.
+            let value = match &mut self.data {
+                IterData::Object(object) => &mut object.index_mut(self.index - 1).1,
+                IterData::Array(array) => array.index_mut(self.index - 1),
+                IterData::Value(_) => {
+                    unreachable!("cannot recurse into non-container type")
+                }
+            };
+
+            *value = (*self.recursive_iter.take().unwrap()).into();
+        }
 
         // If we got here, we are either done with recursively iterating the
         // active value, or we haven't started recursively iterating yet (which
         // would be the case if we haven't encountered a collection `Value` type
         // yet).
-        let item = match &mut self.data {
-            // An `IterData::Object` variant indicates the caller requested
-            // to recursively iterate the value type, and the value itself is an
-            // actual object.
-            //
-            // If no recursion was requested, the object `Value` type is stored
-            // in `IterData::Value` instead.
-            IterData::Object(object) => match object.get_mut(self.index) {
-                Some((key, value)) => {
-                    if value.is_object() || value.is_array() {
-                        // We *only* want to recurse deeper into nested
-                        // collections, if requested by the caller.
-                        self.must_prepare_recursion = self.recursive;
-                    }
-
-                    // SAFETY:
-                    //
-                    // - We borrow each item in the collection *exactly once*.
-                    // - We take a `&mut self`, so we also only borrow the
-                    //   collection itself exactly once.
-                    let key_mut = unsafe { &mut *std::ptr::addr_of_mut!(*key) };
-                    let value_mut = unsafe { &mut *std::ptr::addr_of_mut!(*value) };
-
-                    IterItem::KeyValue(key_mut, value_mut)
-                }
-
-                None => return None,
+        //
+        // We only want to recurse deeper into nested collections, if requested
+        // by the caller.
+        let is_collection = match &self.data {
+            IterData::Object(object) => match object.get(self.index) {
+                Some((_, value)) => value.is_object() || value.is_array(),
+                None => return false,
             },
-
-            // The same principle as above applies here, except for array
-            // collection types.
-            IterData::Array(array) => match array.get_mut(self.index) {
-                Some(value) => {
-                    if value.is_object() || value.is_array() {
-                        // We *only* want to recurse deeper into nested
-                        // collections, if requested by the caller.
-                        self.must_prepare_recursion = self.recursive;
-                    }
-
-                    // SAFETY:
-                    //
-                    // - We borrow each item in the collection *exactly once*.
-                    // - We take a `&mut self`, so we also only borrow the
-                    //   collection itself exactly once.
-                    let value_mut = unsafe { &mut *std::ptr::addr_of_mut!(*value) };
-
-                    IterItem::IndexValue(self.index, value_mut)
-                }
-
-                None => return None,
+            IterData::Array(array) => match array.get(self.index) {
+                Some(value) => value.is_object() || value.is_array(),
+                None => return false,
             },
-
-            // The `IterData::Value` variant indicates we want to return
-            // a non-recursive value. This could also be a collection type, if
-            // the caller has not requested recursive behavior of the iterator.
-            //
             // We check if `self.index == 0` as a means to ensure we ever only
             // return this value once.
-            IterData::Value(value) if self.index == 0 => {
-                // SAFETY:
-                //
-                // - We borrow each item in the collection *exactly once*.
-                // - We take a `&mut self`, so we also only borrow the
-                //   collection itself exactly once.
-                let value_mut = unsafe { &mut *std::ptr::addr_of_mut!(*value) };
-
-                IterItem::Value(value_mut)
-            }
-
-            // This case means `self.index` was non-zero, and no recursion was
-            // requested, so we're done "iterating" over the single-value type.
-            IterData::Value(_) => return None,
+            IterData::Value(_) if self.index == 0 => false,
+            IterData::Value(_) => return false,
         };
 
+        self.must_prepare_recursion = is_collection && self.recursive;
         self.index += 1;
 
-        Some(item)
+        true
+    }
+
+    /// Borrow the item that `advance` last moved to.
+    fn current(&mut self) -> Option<IterItem<'_>> {
+        if self.in_recursive {
+            return self.recursive_iter.as_mut()?.current();
+        }
+
+        let index = self.index.checked_sub(1)?;
+
+        match &mut self.data {
+            IterData::Object(object) => {
+                let (key, value) = object.get_mut(index)?;
+                Some(IterItem::KeyValue(key, value))
+            }
+            IterData::Array(array) => Some(IterItem::IndexValue(index, array.get_mut(index)?)),
+            IterData::Value(value) => Some(IterItem::Value(value)),
+        }
     }
 }
 
-impl<'a> From<ValueIter<'a>> for Value {
-    fn from(iter: ValueIter<'a>) -> Self {
+impl From<ValueIter> for Value {
+    fn from(iter: ValueIter) -> Self {
         iter.data.into()
     }
 }
@@ -363,14 +334,15 @@ mod tests {
                 },
             ),
         ]) {
-            let got: Vec<_> = value
-                .into_iter(recursive)
-                .map(|item| match item {
+            let mut iter = value.into_iter(recursive);
+            let mut got = vec![];
+            while let Some(item) = iter.next() {
+                got.push(match item {
                     IterItem::Value(value) => value.clone(),
                     IterItem::KeyValue(_key, value) => value.clone(),
                     IterItem::IndexValue(..) => todo!(),
-                })
-                .collect();
+                });
+            }
 
             assert_eq!(got, items, "{title}");
         }
@@ -386,7 +358,7 @@ mod tests {
         let mut cleared = false;
         let mut values = vec![];
 
-        for item in iter {
+        while let Some(item) = iter.next() {
             iterations += 1;
 
             match item {
@@ -412,7 +384,7 @@ mod tests {
         iterations = 0;
         values = vec![];
 
-        for item in iter {
+        while let Some(item) = iter.next() {
             iterations += 1;
 
             match item {
@@ -438,7 +410,7 @@ mod tests {
         iterations = 0;
         values = vec![];
 
-        for item in iter {
+        while let Some(item) = iter.next() {
             iterations += 1;
 
             match item {
@@ -457,5 +429,20 @@ mod tests {
         assert_eq!(iterations, 2);
         assert_eq!(values, vec![true.into()]);
         assert!(changed);
+    }
+
+    #[test]
+    fn test_recursive_mutation_written_back() {
+        let data: Value = BTreeMap::from([("foo".into(), vec![Value::from(1)].into())]).into();
+
+        let mut iter = data.into_iter(true);
+        while let Some(item) = iter.next() {
+            if let IterItem::IndexValue(_, value) = item {
+                *value = Value::from(2);
+            }
+        }
+
+        let expected: Value = BTreeMap::from([("foo".into(), vec![Value::from(2)].into())]).into();
+        assert_eq!(Value::from(iter), expected);
     }
 }

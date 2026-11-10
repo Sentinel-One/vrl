@@ -11,7 +11,7 @@ where
 {
     let mut iter = value.into_iter(recursive);
 
-    for item in iter.by_ref() {
+    while let Some(item) = iter.next() {
         if let IterItem::KeyValue(key, _) = item {
             runner.map_key(ctx, key)?;
         }

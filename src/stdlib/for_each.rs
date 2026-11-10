@@ -4,7 +4,9 @@ fn for_each<T>(value: Value, ctx: &mut Context, runner: closure::Runner<T>) -> R
 where
     T: Fn(&mut Context) -> Resolved,
 {
-    for item in value.into_iter(false) {
+    let mut iter = value.into_iter(false);
+
+    while let Some(item) = iter.next() {
         match item {
             IterItem::KeyValue(key, value) => runner.run_key_value(ctx, key, value)?,
             IterItem::IndexValue(index, value) => runner.run_index_value(ctx, index, value)?,
