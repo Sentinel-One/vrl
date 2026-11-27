@@ -46,6 +46,8 @@ impl FromLua for Value {
                     <_>::from_lua(LuaValue::Table(t), lua).map(Self::Object)
                 }
             }
+            // mlua-json's `decode` represents JSON null as `LuaValue::NULL`.
+            LuaValue::LightUserData(ud) if ud.0.is_null() => Ok(Self::Null),
             other => Err(mlua::Error::FromLuaConversionError {
                 from: other.type_name(),
                 to: String::from("Value"),
@@ -287,5 +289,112 @@ mod test {
                 "Test function: {test_src}, value: {value:?}"
             );
         }
+    }
+
+    fn lua_with_null_global() -> Lua {
+        let lua = Lua::new();
+        lua.globals().set("null", LuaValue::NULL).unwrap();
+        lua
+    }
+
+    #[test]
+    fn from_lua_maps_null_light_userdata_to_value_null() {
+        let lua = Lua::new();
+        assert_eq!(Value::from_lua(LuaValue::NULL, &lua).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn from_lua_maps_null_inside_tables_to_value_null() {
+        let pairs = vec![
+            ("null", Value::Null),
+            (
+                "{1, null, 3}",
+                Value::Array(vec![1_i64.into(), Value::Null, 3_i64.into()]),
+            ),
+            ("{null, 2}", Value::Array(vec![Value::Null, 2_i64.into()])),
+            ("{1, null}", Value::Array(vec![1_i64.into(), Value::Null])),
+            ("{null, null}", Value::Array(vec![Value::Null, Value::Null])),
+            (
+                "{a = null, b = 1}",
+                Value::Object(
+                    vec![("a".into(), Value::Null), ("b".into(), 1_i64.into())]
+                        .into_iter()
+                        .collect(),
+                ),
+            ),
+            (
+                "{ nested = { x = null } }",
+                Value::Object(
+                    vec![(
+                        "nested".into(),
+                        Value::Object(vec![("x".into(), Value::Null)].into_iter().collect()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+            (
+                "{ list = { { x = null } } }",
+                Value::Object(
+                    vec![(
+                        "list".into(),
+                        Value::Array(vec![Value::Object(
+                            vec![("x".into(), Value::Null)].into_iter().collect(),
+                        )]),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+        ];
+
+        let lua = lua_with_null_global();
+        for (expression, expected) in pairs {
+            let value: Value = lua.load(expression).eval().unwrap();
+            assert_eq!(value, expected, "expression: {expression:?}");
+        }
+    }
+
+    #[test]
+    fn from_lua_rejects_non_null_light_userdata() {
+        let lua = Lua::new();
+        let res = Value::from_lua(
+            LuaValue::LightUserData(mlua::LightUserData(1 as *mut std::ffi::c_void)),
+            &lua,
+        );
+        assert!(
+            matches!(&res, Err(e) if e.to_string().contains("Unsupported Lua type")),
+            "{res:?}"
+        );
+    }
+
+    #[test]
+    fn from_lua_rejects_non_null_light_userdata_inside_table() {
+        let lua = Lua::new();
+        lua.globals()
+            .set(
+                "ud",
+                LuaValue::LightUserData(mlua::LightUserData(1 as *mut std::ffi::c_void)),
+            )
+            .unwrap();
+        let res: LuaResult<Value> = lua.load("{ a = ud }").eval();
+        assert!(
+            matches!(&res, Err(e) if e.to_string().contains("Unsupported Lua type")),
+            "{res:?}"
+        );
+    }
+
+    #[test]
+    fn from_lua_rejects_full_userdata() {
+        struct Opaque;
+        impl LuaUserData for Opaque {}
+
+        let lua = Lua::new();
+        let ud = lua.create_userdata(Opaque).unwrap();
+        let res = Value::from_lua(LuaValue::UserData(ud), &lua);
+        assert!(
+            matches!(&res, Err(e) if e.to_string().contains("Unsupported Lua type")),
+            "{res:?}"
+        );
     }
 }
